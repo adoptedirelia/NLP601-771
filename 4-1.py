@@ -7,13 +7,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset, DatasetDict, Dataset
 from sklearn.metrics import accuracy_score
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 # PEFT for LoRA
 from peft import get_peft_model, LoraConfig, TaskType
+from tqdm import tqdm
 
 
 # ============== CLI ==============
@@ -33,10 +34,10 @@ def build_argparser():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device: 'cuda', 'cpu', or 'auto' to select automatically")
-    parser.add_argument("--log_every", type=int, default=100, help="Print log every N batches")
+    parser.add_argument("--log_every", type=int, default=10, help="Print log every N batches")
 
     # Data and saving
-    parser.add_argument("--max_length", type=int, default=128, help="Max sequence length for tokenization")
+    parser.add_argument("--max_length", type=int, default=512, help="Max sequence length for tokenization")
     parser.add_argument("--save_dir", type=str, default="./outputs",
                         help="Directory to save plots and best weights")
     parser.add_argument("--save_plot", type=str, default="acc.png",
@@ -120,41 +121,45 @@ def main():
 
     # Load data
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    dataset = load_dataset("sst2")
-    val_idx, test_idx = train_test_split(
-        list(range(len(dataset["validation"]))),
-        test_size=0.5,
-        random_state=42,
-        stratify=dataset["validation"]["label"]  
-    )
+    dataset = load_dataset("wics/strategy-qa")['test'].to_pandas()
 
-    new_val_dataset = dataset["validation"].select(val_idx)
-    new_test_dataset = dataset["validation"].select(test_idx)
 
-    print("New val size:", len(new_val_dataset))
-    print("New test size:", len(new_test_dataset))
+    train,val = train_test_split(dataset, test_size=0.2, random_state=42)
+    val,test = train_test_split(val, test_size=0.5, random_state=42)
+
+
 
     dataset = DatasetDict({
-    "train": dataset["train"],
-    "validation": new_val_dataset,
-    "test": new_test_dataset,
+    "train": Dataset.from_pandas(train),
+    "validation": Dataset.from_pandas(val),
+    "test": Dataset.from_pandas(test),
     }   )
+
     def tokenize_function(examples):
-        return tokenizer(
-            examples["sentence"],
-            padding="max_length",
-            truncation=True,
-            max_length=args.max_length,
-        )
+
+        prompts = [
+            f"Question: {q}\nFact: {f}\n Please answer the question based on the fact."
+            for q, f in zip(examples["question"], examples["facts"])
+        ]
+        labels = [0 if a == False else 1 for a in examples["answer"]]
+        data = {
+            "input_ids": tokenizer(prompts, padding="max_length", truncation=True, max_length=args.max_length)["input_ids"],
+            "attention_mask": tokenizer(prompts, padding="max_length", truncation=True, max_length=args.max_length)["attention_mask"],
+            "labels": labels,
+        }
+        return data
 
     tokenized_datasets = dataset.map(tokenize_function, batched=True)
-    tokenized_datasets = tokenized_datasets.remove_columns(["sentence",'idx'])
-    tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
-    tokenized_datasets.set_format("torch")
+    tokenized_datasets.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask","labels"]  # 加 token_type_ids 如果有
+    )
+
 
     train_dataloader = DataLoader(tokenized_datasets["train"], shuffle=True, batch_size=args.batch_size)
     eval_dataloader = DataLoader(tokenized_datasets["validation"], batch_size=args.batch_size)
     test_dataloader = DataLoader(tokenized_datasets["test"], batch_size=args.batch_size)
+
     print("Data processing finished.")
 
     # Load model
@@ -208,8 +213,9 @@ def main():
         model.train()
         train_preds, train_labels = [], []
 
-        for i, batch in enumerate(train_dataloader):
+        for i, batch in enumerate(tqdm(train_dataloader)):
             batch = {k: v.to(device) for k, v in batch.items()}
+
             labels = batch["labels"]
 
             outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
