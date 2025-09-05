@@ -1,60 +1,118 @@
 import pickle
-import json
-import faiss
 import numpy as np
-from collections import defaultdict
-
-# ---------------------
-# 1. 加载 embeddings
-# ---------------------
-
-with open("scifact_evidence_embeddings.pkl", "rb") as f:
-    abstract_embeddings = pickle.load(f)  # {doc_id: np.array}
-
-with open("scifact_claim_embeddings.pkl", "rb") as f:
-    claim_embeddings = pickle.load(f)  # {claim_id: np.array}
-
-# with open("ground_truth.json", "r") as f:
-#     ground_truth = json.load(f)  # {claim_id: correct_doc_id}
+import faiss
+from datasets import load_dataset
 
 
+class FaissIRSystem:
+    def __init__(self, abstract_embedding_path, claim_embedding_path):
+        self.abstract_embedding_path = abstract_embedding_path
+        self.claim_embedding_path = claim_embedding_path
 
-# ---------------------
-# 2. 构建 FAISS Index
-# ---------------------
+        self.abstract_embeddings = self._load_embeddings(self.abstract_embedding_path)
+        self.claim_embeddings = self._load_embeddings(self.claim_embedding_path)
 
-doc_ids = list(abstract_embeddings.keys())
-doc_vectors = np.stack([abstract_embeddings[doc_id] for doc_id in doc_ids]).astype("float32")
+        self.embedding_dim = len(next(iter(self.abstract_embeddings.values())))
+        self.index = faiss.IndexFlatL2(self.embedding_dim)
 
-faiss.normalize_L2(doc_vectors)  # cosine similarity
-dimension = doc_vectors.shape[1]
-index = faiss.IndexFlatIP(dimension)
-index.add(doc_vectors)
+        self.doc_id_map = []
+        self._build_index()
 
-# ---------------------
-# 3. 查询并评估
-# ---------------------
+    def _load_embeddings(self, path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
 
-total = 0
-correct = 0
+    def _build_index(self):
+        embedding_matrix = []
 
-for claim_id, query_vec in claim_embeddings.items():
-    query = query_vec.astype("float32").reshape(1, -1)
-    faiss.normalize_L2(query)
-    D, I = index.search(query, k=1)
-    retrieved_doc_id = doc_ids[I[0][0]]
+        for doc, embedding in self.abstract_embeddings.items():
+            doc_id, abstract_text = doc
+            self.doc_id_map.append((str(doc_id), abstract_text))
+            embedding_matrix.append(np.array(embedding).astype("float32"))
 
-    gt_doc_id = ground_truth.get(claim_id)
-    if gt_doc_id is not None:
-        total += 1
-        if retrieved_doc_id == gt_doc_id:
-            correct += 1
+        embedding_matrix = np.vstack(embedding_matrix).astype("float32")
+        self.index.add(embedding_matrix)
 
-recall_at_1 = correct / total if total > 0 else 0.0
+    def retrieve(self, claim_embedding, top_k=5):
+        query_vector = np.array([claim_embedding]).astype("float32")
+        D, I = self.index.search(query_vector, top_k)
 
-# ---------------------
-# 4. 打印结果
-# ---------------------
+        results = []
+        for idx in I[0]:
+            doc_id, abstract_text = self.doc_id_map[idx]
+            results.append((doc_id, abstract_text))
+        return results
 
-print(f"Recall@1: {recall_at_1:.4f}")
+    def retrieve_all_claims(self, top_k=5, limit=None):
+        results_all = {}
+        for i, (claim_doc, claim_embedding) in enumerate(self.claim_embeddings.items()):
+            claim_id, claim_text = claim_doc
+            results = self.retrieve(claim_embedding, top_k=top_k)
+            results_all[str(claim_id)] = {
+                "claim": claim_text,
+                "results": results
+            }
+            if limit is not None and i + 1 >= limit:
+                break
+        return results_all
 
+
+    def evaluate(self, ground_truth: dict, top_k=10):
+        mrr_total = 0.0
+        map_total = 0.0
+        count = 0
+
+        for claim_doc, claim_embedding in self.claim_embeddings.items():
+            claim_id, _ = claim_doc
+            claim_id_str = str(claim_id)
+            relevant_docs = ground_truth.get(claim_id_str, [])
+            if not relevant_docs:
+                continue 
+
+            results = self.retrieve(claim_embedding, top_k=top_k)
+            retrieved_ids = [doc_id for doc_id, _ in results]
+
+            rr = 0.0
+            for rank, doc_id in enumerate(retrieved_ids):
+                if doc_id in relevant_docs:
+                    rr = 1.0 / (rank + 1)
+                    break
+            mrr_total += rr
+
+            num_relevant = 0
+            ap = 0.0
+            for rank, doc_id in enumerate(retrieved_ids):
+                if doc_id in relevant_docs:
+                    num_relevant += 1
+                    ap += num_relevant / (rank + 1)
+            if num_relevant > 0:
+                ap /= len(relevant_docs)
+            map_total += ap
+
+            count += 1
+
+        mean_mrr = mrr_total / count if count > 0 else 0
+        mean_ap = map_total / count if count > 0 else 0
+
+        print(f"MRR: {mean_mrr:.4f}")
+        print(f"MAP: {mean_ap:.4f}")
+
+
+ir_system = FaissIRSystem(
+    abstract_embedding_path="scifact_evidence_embeddings.pkl",
+    claim_embedding_path="scifact_claim_embeddings.pkl"
+)
+
+
+dataset = load_dataset("allenai/scifact", "claims")
+ground_truth = {}
+
+for item in dataset["train"]:
+
+    claim_id = str(item["id"])
+    relevant_doc_ids = item['cited_doc_ids']  # list of integers
+    ground_truth[claim_id] = [str(doc_id) for doc_id in relevant_doc_ids]
+
+ir_system.evaluate(ground_truth, top_k=1)
+ir_system.evaluate(ground_truth, top_k=10)
+ir_system.evaluate(ground_truth, top_k=50)
